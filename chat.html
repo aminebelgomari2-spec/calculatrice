@@ -18,7 +18,7 @@
   .m .n { font-size:11px; color:#8b93a7; display:block; margin-bottom:2px; }
   .m.me { align-self:flex-end; background:#2b5cff; }
   .m.me .n { color:#cdd8ff; }
-  .sys { align-self:center; color:#6b7388; font-size:12px; }
+  .sys { align-self:center; color:#6b7388; font-size:12px; text-align:center; }
   form { display:flex; gap:8px; padding:10px; background:#171a21; }
   form input { flex:1; background:#0f1115; border:1px solid #2a2f3b; color:#e8e8ea; border-radius:20px; padding:10px 14px; font-size:16px; outline:none; }
   form button { background:#2b5cff; color:#fff; border:0; border-radius:20px; padding:0 18px; font-size:15px; cursor:pointer; }
@@ -45,7 +45,7 @@
   const myId = Math.random().toString(36).slice(2, 10);
   $('name').value = 'Anonyme-' + Math.floor(1000 + Math.random() * 9000);
 
-  let client = null, key = null, topic = null, peers = new Map(), seen = new Set(), hb = null;
+  let client = null, rooms = [], peers = new Map(), seen = new Set(), hb = null, mode = '';
 
   const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
   const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -61,53 +61,89 @@
   }
   function status() {
     const n = [...peers.values()].filter(t => Date.now() - t < 25000).length;
-    st.textContent = client && client.connected ? ('Salle active · ' + (n + 1) + ' appareil(s)') : 'Déconnecté';
+    const codes = rooms.map(r => r.code).join(' / ');
+    st.textContent = client && client.connected
+      ? ('Actif · ' + (n + 1) + ' appareil(s) · ' + codes)
+      : 'Déconnecté';
   }
 
-  async function getSecret() {
-    for (const u of ['https://api.ipify.org?format=json', 'https://api64.ipify.org?format=json']) {
-      try { const r = await fetch(u); const j = await r.json(); if (j.ip) return 'ip:' + j.ip; } catch (e) {}
-    }
-    return null;
+  // Récupère une IP avec timeout
+  async function getIp(url) {
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 5000);
+    try { const r = await fetch(url, { signal: ctl.signal }); const j = await r.json(); return j.ip || null; }
+    catch (e) { return null; }
+    finally { clearTimeout(to); }
+  }
+  // Préfixe /64 d'une IPv6 (commun à tous les appareils d'une même box)
+  function prefix64(ip) {
+    let [head, tail] = ip.split('::');
+    const h = head ? head.split(':') : [];
+    const t = tail !== undefined && tail ? tail.split(':') : [];
+    const missing = 8 - h.length - t.length;
+    const all = tail === undefined ? h : [...h, ...Array(Math.max(missing, 0)).fill('0'), ...t];
+    return all.slice(0, 4).map(x => x.padStart(4, '0')).join(':');
+  }
+  async function getSecrets() {
+    const [v4, v6] = await Promise.all([
+      getIp('https://api.ipify.org?format=json'),
+      getIp('https://api6.ipify.org?format=json')
+    ]);
+    const out = [];
+    if (v4) out.push('ip4:' + v4);
+    if (v6 && v6.includes(':')) out.push('ip6:' + prefix64(v6));
+    return out;
   }
 
-  async function encrypt(obj) {
+  async function makeRoom(secret) {
+    const h = await sha('topic|' + secret);
+    const topic = 'calc-chat/v1/' + hex(h).slice(0, 32);
+    const code = hex(await sha('code|' + secret)).slice(0, 4);
+    const key = await crypto.subtle.importKey('raw', await sha('key|' + secret), 'AES-GCM', false, ['encrypt', 'decrypt']);
+    return { topic, key, code };
+  }
+
+  async function encrypt(key, obj) {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
     return b64(iv) + '.' + b64(ct);
   }
-  async function decrypt(s) {
+  async function decrypt(key, s) {
     const [iv, ct] = s.split('.');
     const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, key, unb64(ct));
     return JSON.parse(dec.decode(pt));
   }
   async function send(obj) {
     if (!client || !client.connected) return;
-    client.publish(topic, await encrypt({ ...obj, id: myId, name: $('name').value || 'Anonyme' }));
+    const body = { ...obj, id: myId, name: $('name').value || 'Anonyme' };
+    for (const r of rooms) client.publish(r.topic, await encrypt(r.key, body));
   }
 
   async function start(manualRoom) {
     if (client) { clearInterval(hb); client.end(true); client = null; }
-    peers.clear(); log.innerHTML = '';
+    peers.clear(); log.innerHTML = ''; rooms = [];
     st.textContent = 'Détection du réseau…';
-    const secret = manualRoom ? 'room:' + manualRoom : await getSecret();
-    if (!secret) { st.textContent = 'Réseau introuvable'; sys('Impossible de détecter le wifi. Entre une salle manuelle en haut.'); return; }
-    topic = 'calc-chat/v1/' + hex(await sha('topic|' + secret)).slice(0, 32);
-    const raw = await sha('key|' + secret);
-    key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    const secrets = manualRoom ? ['room:' + manualRoom] : await getSecrets();
+    if (!secrets.length) {
+      st.textContent = 'Réseau introuvable';
+      sys('Impossible de détecter le wifi (bloqueur de pub / VPN ?). Entre une salle manuelle en haut.');
+      return;
+    }
+    rooms = await Promise.all(secrets.map(makeRoom));
 
     client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', { clientId: 'cc_' + myId, reconnectPeriod: 3000 });
     client.on('connect', () => {
-      client.subscribe(topic, () => { send({ type: 'hi' }); status(); });
-      sys(manualRoom ? 'Salle manuelle : ' + manualRoom : 'Connecté aux appareils de ton wifi.');
+      client.subscribe(rooms.map(r => r.topic), () => { send({ type: 'hi' }); status(); });
+      sys(manualRoom ? 'Salle manuelle : ' + manualRoom : 'Connecté. Si un autre appareil a le même code en haut, vous vous verrez.');
     });
     client.on('close', status);
-    client.on('message', async (_t, payload) => {
+    client.on('message', async (t, payload) => {
+      const room = rooms.find(r => r.topic === t); if (!room) return;
       try {
-        const m = await decrypt(payload.toString());
+        const m = await decrypt(room.key, payload.toString());
         if (m.id === myId) return;
         peers.set(m.id, Date.now());
-        if (m.type === 'hi') { send({ type: 'pong' }); }
+        if (m.type === 'hi') send({ type: 'pong' });
         else if (m.type === 'chat') {
           const k = m.id + m.t; if (seen.has(k)) return; seen.add(k);
           msg(m.name, m.text, false);
